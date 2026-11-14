@@ -1,0 +1,15 @@
+# Data pribadi pengguna - JANGAN diunggah
+riwayat.db
+
+# Lingkungan Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Salinan model hasil ekstrak (cukup file .keras di folder model/)
+model_extracted/
+destiscan-klasifikasi/model/*/
+
+# Lain-lain
+.DS_Store
