@@ -1,186 +1,315 @@
-"""DentiScan - skrining awal kondisi gigi & mulut (Streamlit) + riwayat."""
 import io
 import json
 import sqlite3
+import uuid
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
+import pandas as pd
 import streamlit as st
-from PIL import Image, ImageOps
+from PIL import Image
+from ultralytics import YOLO
 
-MODEL_PATH = Path("model/best_mobilenetv2_finetuned.keras")
+# ------------------------------------------------------------------
+# PENGATURAN
+#   "lokal" -> riwayat disimpan di file riwayat.db (tahan restart, untuk dipakai sendiri)
+#   "sesi"  -> riwayat hanya ada selama tab browser terbuka (aman untuk website publik)
+# ------------------------------------------------------------------
+MODE = "lokal"
 DB_PATH = Path("riwayat.db")
-IMG_SIZE = (224, 224)
 
-# Urutan ini HARUS sama dengan train_ds.class_names di notebook (alfabetis).
-CLASS_NAMES = ["calculus", "cancer", "caries", "gingivitis", "ulcer"]
+st.set_page_config(page_title="DentiScan", page_icon="🦷")
 
-INFO = {
-    "calculus": ("Karang gigi (calculus)",
-                 "Plak yang mengeras. Perlu dibersihkan dokter gigi (scaling)."),
-    "cancer": ("Lesi mencurigakan (kemungkinan kanker mulut)",
-               "Segera periksakan ke dokter/dokter gigi. Jangan menunda."),
-    "caries": ("Gigi berlubang (caries)",
-               "Perlu ditambal/dirawat dokter gigi sebelum membesar."),
-    "gingivitis": ("Radang gusi (gingivitis)",
-                   "Jaga kebersihan mulut, sikat gigi teratur, dan periksa ke dokter gigi."),
-    "ulcer": ("Sariawan / ulkus mulut",
-              "Sering sembuh sendiri. Jika >2 minggu tidak membaik, periksakan ke dokter."),
+LABEL = {
+    "caries": "Gigi berlubang (karies)",
+    "ulcer": "Sariawan / ulkus",
+    "tooth discoloration": "Perubahan warna gigi",
+    "gingivitis": "Radang gusi",
 }
 
-CONFIDENCE_THRESHOLD = 0.60  # di bawah ini hasil dianggap tidak yakin
 
-st.set_page_config(page_title="DentiScan", page_icon="🦷", layout="centered")
+def terjemah(nama):
+    return LABEL.get(nama.lower(), nama)
 
 
-# ---------------------------------------------------------------- Database
-def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS riwayat (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
-               waktu TEXT NOT NULL,
-               label TEXT NOT NULL,
-               confidence REAL NOT NULL,
-               probs TEXT NOT NULL,
-               foto BLOB
-           )"""
+# Informasi edukasi umum per kondisi (bukan pengganti pemeriksaan dokter gigi)
+INFO = {
+    "caries": {
+        "penyebab": [
+            "Bakteri plak mengubah gula menjadi asam yang melarutkan email gigi.",
+            "Sering makan/minum manis atau lengket, terutama di antara waktu makan.",
+            "Menyikat gigi kurang rutin atau tidak memakai pasta gigi berfluoride.",
+            "Mulut kering (kurang air liur) dan sisa makanan terselip di sela gigi.",
+        ],
+        "solusi": [
+            "Sikat gigi 2x sehari dengan pasta gigi berfluoride, bersihkan sela gigi dengan benang gigi.",
+            "Kurangi makanan dan minuman manis, terutama sebelum tidur.",
+            "Lubang gigi tidak bisa sembuh sendiri: perlu ditambal atau dirawat dokter gigi.",
+            "Kontrol ke dokter gigi setiap 6 bulan.",
+        ],
+        "dokter": "Segera periksa jika gigi nyeri berdenyut, bengkak, atau ada nanah.",
+    },
+    "ulcer": {
+        "penyebab": [
+            "Luka akibat tergigit atau tergesek kawat gigi/gigi tajam.",
+            "Stres, kurang tidur, atau perubahan hormon.",
+            "Kekurangan zat besi, vitamin B12, atau asam folat.",
+            "Iritasi bahan pasta gigi tertentu, makanan pedas/asam, atau infeksi virus.",
+        ],
+        "solusi": [
+            "Hindari makanan pedas, asam, dan keras selama sariawan.",
+            "Jaga kebersihan mulut, berkumur air garam hangat atau obat kumur antiseptik.",
+            "Gel/obat oles pelindung sariawan dari apotek dapat membantu meredakan nyeri.",
+            "Perbanyak air putih, sayur, dan buah. Sariawan biasa umumnya sembuh dalam 1-2 minggu.",
+        ],
+        "dokter": "Periksakan jika luka tidak sembuh lebih dari 2-3 minggu, makin membesar, "
+                  "sering kambuh, atau disertai demam. Luka mulut yang menetap perlu "
+                  "dinilai dokter untuk menyingkirkan penyebab serius.",
+    },
+    "tooth discoloration": {
+        "penyebab": [
+            "Noda dari kopi, teh, minuman bersoda, dan rokok.",
+            "Plak atau karang gigi yang menguning.",
+            "Gigi berlubang, trauma pada gigi, atau gigi yang pernah dirawat saluran akar.",
+            "Penggunaan obat tertentu saat gigi tumbuh, kelebihan fluoride, dan penuaan.",
+        ],
+        "solusi": [
+            "Bersihkan karang gigi (scaling) di dokter gigi secara berkala.",
+            "Sikat gigi teratur, kumur setelah minum kopi/teh, kurangi rokok.",
+            "Pemutihan gigi (bleaching) sebaiknya dilakukan atau diawasi dokter gigi.",
+            "Untuk noda yang tidak hilang, dokter dapat menyarankan veneer atau tambalan estetik.",
+        ],
+        "dokter": "Periksa jika hanya satu gigi yang menggelap, karena bisa tanda gigi "
+                  "mati atau lubang di dalam.",
+    },
+    "gingivitis": {
+        "penyebab": [
+            "Plak dan karang gigi menumpuk di garis gusi.",
+            "Menyikat gigi kurang bersih atau tidak membersihkan sela gigi.",
+            "Merokok, diabetes, dan perubahan hormon (misalnya kehamilan).",
+            "Obat tertentu, mulut kering, atau kekurangan vitamin C.",
+        ],
+        "solusi": [
+            "Sikat gigi 2x sehari dengan sikat lembut hingga ke garis gusi, tanpa menekan keras.",
+            "Gunakan benang gigi dan obat kumur antiseptik.",
+            "Bersihkan karang gigi di dokter gigi.",
+            "Dengan kebersihan yang baik, radang gusi ringan biasanya membaik dalam 1-2 minggu.",
+        ],
+        "dokter": "Periksa jika gusi terus berdarah, bengkak, bau mulut menetap, atau gigi "
+                  "terasa goyang, karena bisa berkembang menjadi radang jaringan penyangga gigi.",
+    },
+}
+
+
+def tampilkan_info(kunci_list, dalam_expander=False):
+    """Tampilkan penyebab & solusi untuk tiap kondisi unik yang terdeteksi."""
+    for k in dict.fromkeys(kunci_list):
+        info = INFO.get(str(k).lower())
+        if not info:
+            continue
+        judul = f"ℹ️ {terjemah(k)}: penyebab & solusi"
+        # Streamlit tidak mengizinkan expander di dalam expander
+        wadah = st.container() if dalam_expander else st.expander(judul)
+        with wadah:
+            if dalam_expander:
+                st.markdown(f"**{judul}**")
+            st.markdown("**Kemungkinan penyebab**")
+            for p in info["penyebab"]:
+                st.markdown(f"- {p}")
+            st.markdown("**Yang bisa dilakukan**")
+            for s in info["solusi"]:
+                st.markdown(f"- {s}")
+            st.markdown(f"**Kapan ke dokter gigi:** {info['dokter']}")
+            st.caption("Informasi umum, bukan pengganti pemeriksaan dokter gigi.")
+
+
+@st.cache_resource
+def load_model():
+    return YOLO("best.pt")
+
+
+# ------------------------------------------------------------------
+# PENYIMPANAN RIWAYAT
+# ------------------------------------------------------------------
+def _db():
+    con = sqlite3.connect(DB_PATH)
+    con.execute(
+        """CREATE TABLE IF NOT EXISTS riwayat(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            waktu TEXT, nama_file TEXT, conf REAL,
+            temuan TEXT, gambar BLOB)"""
     )
-    return conn
+    return con
 
 
-def save_record(label, conf, probs, img, save_photo):
-    foto = None
-    if save_photo:
-        thumb = ImageOps.exif_transpose(img).convert("RGB")
-        thumb.thumbnail((320, 320))
-        buf = io.BytesIO()
-        thumb.save(buf, "JPEG", quality=80)
-        foto = buf.getvalue()
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO riwayat (waktu, label, confidence, probs, foto) VALUES (?,?,?,?,?)",
-            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), label, conf,
-             json.dumps({n: float(p) for n, p in zip(CLASS_NAMES, probs)}), foto),
+def simpan(nama_file, conf, temuan, gambar_bytes):
+    waktu = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if MODE == "lokal":
+        with closing(_db()) as con, con:
+            con.execute(
+                "INSERT INTO riwayat(waktu, nama_file, conf, temuan, gambar) "
+                "VALUES (?,?,?,?,?)",
+                (waktu, nama_file, conf, json.dumps(temuan), gambar_bytes),
+            )
+    else:
+        st.session_state.setdefault("riwayat", []).append(
+            dict(id=uuid.uuid4().hex, waktu=waktu, nama_file=nama_file,
+                 conf=conf, temuan=json.dumps(temuan), gambar=gambar_bytes)
         )
 
 
-def load_records():
-    with get_conn() as conn:
-        return conn.execute(
-            "SELECT id, waktu, label, confidence, probs, foto FROM riwayat ORDER BY id DESC"
-        ).fetchall()
+def daftar():
+    """Semua riwayat, terbaru di atas."""
+    if MODE == "lokal":
+        with closing(_db()) as con:
+            con.row_factory = sqlite3.Row
+            rows = con.execute("SELECT * FROM riwayat ORDER BY id DESC").fetchall()
+            return [dict(r) for r in rows]
+    return list(reversed(st.session_state.get("riwayat", [])))
 
 
-def delete_record(rec_id=None):
-    with get_conn() as conn:
-        if rec_id is None:
-            conn.execute("DELETE FROM riwayat")
-        else:
-            conn.execute("DELETE FROM riwayat WHERE id = ?", (rec_id,))
+def hapus(rid):
+    if MODE == "lokal":
+        with closing(_db()) as con, con:
+            con.execute("DELETE FROM riwayat WHERE id = ?", (rid,))
+    else:
+        st.session_state["riwayat"] = [
+            r for r in st.session_state.get("riwayat", []) if r["id"] != rid
+        ]
 
 
-# ------------------------------------------------------------------- Model
-@st.cache_resource(show_spinner="Memuat model...")
-def load_model():
-    from tensorflow import keras
-    from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
-
-    try:
-        return keras.models.load_model(
-            MODEL_PATH, custom_objects={"preprocess_input": preprocess_input},
-            compile=False)
-    except Exception:
-        # Lambda layer kadang butuh safe_mode=False. Aman karena model milik sendiri.
-        return keras.models.load_model(
-            MODEL_PATH, custom_objects={"preprocess_input": preprocess_input},
-            compile=False, safe_mode=False)
+def hapus_semua():
+    if MODE == "lokal":
+        with closing(_db()) as con, con:
+            con.execute("DELETE FROM riwayat")
+    else:
+        st.session_state["riwayat"] = []
 
 
-def predict(model, image: Image.Image) -> np.ndarray:
-    image = ImageOps.exif_transpose(image).convert("RGB").resize(IMG_SIZE)
-    # JANGAN dibagi 255: preprocess_input MobileNetV2 sudah ada DI DALAM model.
-    arr = np.expand_dims(np.array(image, dtype=np.float32), axis=0)
-    return model.predict(arr, verbose=0)[0]
-
-
-# ---------------------------------------------------------------------- UI
+# ------------------------------------------------------------------
+# TAMPILAN
+# ------------------------------------------------------------------
 st.title("🦷 DentiScan")
-st.caption("Skrining awal kesehatan gigi & mulut berbasis AI")
-st.warning("Hasil ini **bukan diagnosis medis**. Selalu konsultasikan dengan dokter gigi.")
-
-if not MODEL_PATH.exists():
-    st.error(f"File model tidak ditemukan di `{MODEL_PATH}`. Lihat README.md.")
-    st.stop()
+st.caption("Skrining awal kondisi gigi dan mulut berbasis AI")
 
 model = load_model()
 
-tab_scan, tab_history = st.tabs(["🔍 Pindai", "🕘 Riwayat"])
+with st.sidebar:
+    st.header("Pengaturan")
+    conf = st.slider("Ambang kepercayaan", 0.10, 0.90, 0.25, 0.05)
+    st.caption("Kondisi yang dikenali model:")
+    for n in model.names.values():
+        st.write("•", terjemah(n))
+    st.caption(
+        "DentiScan tidak dapat mendeteksi kanker mulut, karang gigi, "
+        "atau penyakit lain di luar daftar ini."
+    )
+    st.divider()
+    if MODE == "lokal":
+        st.caption("📁 Riwayat disimpan di file riwayat.db pada komputer ini.")
+    else:
+        st.caption("🕘 Riwayat hanya tersimpan selama tab ini terbuka.")
 
-# ----- Tab Pindai
-with tab_scan:
-    source = st.radio("Sumber foto", ["Kamera", "Unggah file"], horizontal=True)
-    file = (st.camera_input("Ambil foto area yang bermasalah")
-            if source == "Kamera"
-            else st.file_uploader("Pilih foto", type=["jpg", "jpeg", "png", "webp"]))
+tab_deteksi, tab_riwayat = st.tabs(["🔍 Deteksi", "🕘 Riwayat"])
 
-    if file is not None:
-        img = Image.open(file)
-        st.image(img, caption="Foto Anda", use_container_width=True)
+# ---------------- TAB DETEKSI ----------------
+with tab_deteksi:
+    file = st.file_uploader("Unggah foto gigi/mulut", type=["jpg", "jpeg", "png"])
 
-        with st.spinner("Menganalisis..."):
-            probs = predict(model, img)
+    if file:
+        img = Image.open(file).convert("RGB")
+        res = model(img, conf=conf)[0]
+        hasil_img = Image.fromarray(res.plot()[:, :, ::-1])
+        st.image(hasil_img, caption="Hasil deteksi", use_container_width=True)
 
-        order = np.argsort(probs)[::-1]
-        top = CLASS_NAMES[order[0]]
-        conf = float(probs[order[0]])
+        temuan = [
+            {
+                "kunci": model.names[int(b.cls)],
+                "kondisi": terjemah(model.names[int(b.cls)]),
+                "keyakinan": round(float(b.conf), 2),
+            }
+            for b in res.boxes
+        ]
 
-        st.subheader("Hasil")
-        if conf < CONFIDENCE_THRESHOLD:
-            st.info(f"Model kurang yakin (kepercayaan {conf:.0%}). Coba foto ulang dengan "
-                    "pencahayaan lebih terang dan fokus jelas, atau periksa ke dokter gigi.")
+        if not temuan:
+            st.info(
+                "Tidak ada temuan pada foto ini. Ini TIDAK berarti mulut Anda sehat, "
+                "karena DentiScan hanya mengenali 4 kondisi."
+            )
         else:
-            title, advice = INFO[top]
-            (st.error if top == "cancer" else st.success)(f"**{title}** — {conf:.0%}")
-            st.write(advice)
+            st.subheader("Temuan")
+            for t in temuan:
+                st.write(f"- **{t['kondisi']}**: {t['keyakinan']:.0%}")
+            st.subheader("Penyebab & solusi")
+            tampilkan_info([t["kunci"] for t in temuan])
 
-        st.write("Probabilitas tiap kelas:")
-        for i in order:
-            st.progress(float(probs[i]), text=f"{INFO[CLASS_NAMES[i]][0]}: {probs[i]:.1%}")
-
-        st.caption("Model hanya mengenali 5 kondisi di atas dan tidak punya kelas "
-                   "'sehat'. Gigi/gusi normal tetap bisa diberi label salah.")
+        st.warning(
+            "DentiScan hanya alat skrining awal, bukan diagnosis. "
+            "Periksakan ke dokter gigi untuk kepastian."
+        )
 
         st.divider()
-        save_photo = st.checkbox("Simpan juga fotonya (versi kecil)", value=False)
+        sertakan_foto = st.checkbox(
+            "Sertakan foto hasil deteksi di riwayat",
+            value=False,
+            help="Foto mulut adalah data kesehatan. Biarkan mati jika tidak perlu.",
+        )
         if st.button("💾 Simpan ke riwayat"):
-            save_record(top, conf, probs, img, save_photo)
+            gambar_bytes = None
+            if sertakan_foto:
+                buf = io.BytesIO()
+                hasil_img.save(buf, format="JPEG", quality=85)
+                gambar_bytes = buf.getvalue()
+            simpan(file.name, conf, temuan, gambar_bytes)
             st.success("Tersimpan. Lihat di tab Riwayat.")
 
-# ----- Tab Riwayat
-with tab_history:
-    records = load_records()
-    if not records:
-        st.info("Belum ada riwayat. Pindai foto lalu tekan 'Simpan ke riwayat'.")
+# ---------------- TAB RIWAYAT ----------------
+with tab_riwayat:
+    data = daftar()
+
+    if not data:
+        st.info("Belum ada riwayat. Lakukan deteksi lalu klik 'Simpan ke riwayat'.")
     else:
-        st.write(f"Total: **{len(records)}** pemeriksaan")
-        for rec_id, waktu, label, conf, probs_json, foto in records:
-            with st.container(border=True):
-                col_img, col_txt = st.columns([1, 3])
-                if foto:
-                    col_img.image(foto, use_container_width=True)
+        # Tabel ringkasan + unduh CSV
+        ringkas = []
+        for r in data:
+            t = json.loads(r["temuan"])
+            ringkas.append(
+                {
+                    "Waktu": r["waktu"],
+                    "File": r["nama_file"],
+                    "Jumlah temuan": len(t),
+                    "Kondisi": ", ".join(sorted({x["kondisi"] for x in t})) or "-",
+                    "Ambang": r["conf"],
+                }
+            )
+        df = pd.DataFrame(ringkas)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.download_button(
+            "⬇️ Unduh riwayat (CSV)",
+            df.to_csv(index=False).encode("utf-8"),
+            "riwayat_dentiscan.csv",
+            "text/csv",
+        )
+
+        st.subheader("Detail")
+        for r in data:
+            t = json.loads(r["temuan"])
+            with st.expander(f"{r['waktu']} — {r['nama_file']} — {len(t)} temuan"):
+                if t:
+                    st.table(pd.DataFrame(t)[["kondisi", "keyakinan"]])
+                    tampilkan_info([x.get("kunci", "") for x in t], dalam_expander=True)
                 else:
-                    col_img.caption("(foto tidak disimpan)")
-                col_txt.markdown(f"**{INFO[label][0]}**  \n{waktu} · kepercayaan {conf:.0%}")
-                if conf < CONFIDENCE_THRESHOLD:
-                    col_txt.caption("⚠️ Kepercayaan rendah saat itu")
-                if col_txt.button("🗑️ Hapus", key=f"del_{rec_id}"):
-                    delete_record(rec_id)
+                    st.write("Tidak ada temuan.")
+                if r["gambar"]:
+                    st.image(r["gambar"], use_container_width=True)
+                if st.button("🗑️ Hapus catatan ini", key=f"del_{r['id']}"):
+                    hapus(r["id"])
                     st.rerun()
 
         st.divider()
-        if st.checkbox("Saya yakin ingin menghapus SEMUA riwayat"):
-            if st.button("Hapus semua riwayat", type="primary"):
-                delete_record()
-                st.rerun()
+        yakin = st.checkbox("Saya yakin ingin menghapus SEMUA riwayat")
+        if st.button("Hapus semua riwayat", disabled=not yakin):
+            hapus_semua()
+            st.rerun()
